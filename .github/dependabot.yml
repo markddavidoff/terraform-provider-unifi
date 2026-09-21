@@ -16,3 +16,19 @@ updates:
     schedule:
       # Check for updates to Go modules every weekday
       interval: "daily"
+
+    ignore:
+      # go-unifi is deliberately pinned, and go.mod carries a `replace` onto a
+      # fork of it. Its published tags are not a reliable ordering of its
+      # contents: v1.34.0/v1.34.1 are semver-higher but content-older than the
+      # v1.33.43-0.2026... pseudo-version this tree needs, and dropped API the
+      # provider calls (DeviceRadioTable.AssistedRoaming*). Dependabot raised
+      # that as a routine MINOR bump and main stopped compiling for 3.5 weeks.
+      #
+      # Minor and major bumps of this module are therefore a human decision.
+      # Patch bumps still flow normally, and still have to pass CI before
+      # .github/workflows/dependabot.yml will merge them.
+      - dependency-name: "github.com/ubiquiti-community/go-unifi"
+        update-types:
+          - "version-update:semver-minor"
+          - "version-update:semver-major"

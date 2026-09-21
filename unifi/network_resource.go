@@ -1762,8 +1762,16 @@ func (r *networkResource) modelToNetwork(
 				network.DHCPDBootFilename = util.Ptr("")
 			}
 			network.DHCPDEnabled = dhcpServer.Enabled.ValueBool()
-			network.DHCPDStart = dhcpServer.Start.ValueStringPointer()
-			network.DHCPDStop = dhcpServer.Stop.ValueStringPointer()
+			// optStr (not ValueStringPointer) on purpose: start/stop are
+			// Optional+Computed with no default, so at create they are
+			// *unknown*, and ValueStringPointer returns a pointer to "" for an
+			// unknown value — nil only for a null one. go-unifi substitutes the
+			// subnet-derived DHCP range only when the pointer is nil, so a
+			// pointer-to-"" reaches the wire as `"dhcpd_start": ""`; combined
+			// with the `setting_preference = "auto"` schema default that is an
+			// unhandled HTTP 500 on Network 10.6.101 (#2).
+			network.DHCPDStart = optStr(dhcpServer.Start)
+			network.DHCPDStop = optStr(dhcpServer.Stop)
 			network.DHCPDGatewayEnabled = dhcpServer.GatewayEnabled.ValueBool()
 			network.DHCPDConflictChecking = dhcpServer.ConflictChecking.ValueBool()
 			network.DHCPDNtpEnabled = dhcpServer.NtpEnabled.ValueBool()

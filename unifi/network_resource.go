@@ -2,6 +2,7 @@ package unifi
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"regexp"
 	"strings"
@@ -1269,6 +1270,15 @@ func (r *networkResource) Read(
 		// Get the network by ID
 		network, err = r.client.GetNetwork(ctx, site, id)
 		if err != nil {
+			// A network deleted out-of-band (the controller answers the read
+			// with 404, or returns no object for the ID) is drift, not a
+			// failure: drop it from state so the next plan re-creates it.
+			// go-unifi only produces *unifi.NotFoundError for those two cases,
+			// so every other failure still surfaces as an error (#4).
+			if errors.As(err, new(*unifi.NotFoundError)) {
+				resp.State.RemoveResource(ctx)
+				return
+			}
 			resp.Diagnostics.AddError(
 				"Error Reading network",
 				"Could not read network ID "+id+": "+err.Error(),
@@ -1279,6 +1289,10 @@ func (r *networkResource) Read(
 		// Get the network by name
 		network, err = r.client.GetNetworkByName(ctx, site, data.Name.ValueString())
 		if err != nil {
+			if errors.As(err, new(*unifi.NotFoundError)) {
+				resp.State.RemoveResource(ctx)
+				return
+			}
 			resp.Diagnostics.AddError(
 				"Error Reading network",
 				"Could not read network name "+data.Name.ValueString()+": "+err.Error(),

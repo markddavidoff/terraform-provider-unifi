@@ -2,22 +2,23 @@
 name: CI/CD
 
 # This GitHub action runs your tests for each pull request and push.
-# Optionally, you can turn it on using a schedule for regular testing.
+#
+# NOTE: deliberately NOT path-filtered.
+#
+# This workflow used to run only when `**.go`, `go.mod`, `go.sum` or this file
+# changed. That made "CI/CD" an *intermittent* check: on any PR that touched
+# none of those paths the jobs below never produced a check run at all. A check
+# that sometimes does not exist cannot be made a required status check, and a
+# PR with no checks is a PR that auto-merge will happily land.
+#
+# Running unconditionally on every PR costs a couple of runner-minutes and buys
+# a check that is always present, so it can be required in branch protection
+# and so `.github/workflows/dependabot.yml` can block on it.
 on:
   pull_request:
-    paths:
-    - "**.go"
-    - "go.mod"
-    - "go.sum"
-    - ".github/workflows/ci.yaml"
   push:
     branches:
     - "main"
-    paths:
-    - "**.go"
-    - "go.mod"
-    - "go.sum"
-    - ".github/workflows/ci.yaml"
 
 # contents: read is needed to check out the repository.
 # id-token: write is needed for Codecov OIDC uploads.
@@ -48,7 +49,7 @@ jobs:
   build:
     name: Build
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
     - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
@@ -56,7 +57,51 @@ jobs:
         go-version-file: "go.mod"
         cache: true
     - run: go mod download
-    - run: go build -v .
+
+    # --- Regression guard -------------------------------------------------
+    # Between 2026-08-28 and 2026-09-21 main did not compile. Dependabot moved
+    # github.com/ubiquiti-community/go-unifi off the pseudo-version
+    # v1.33.43-0.20260824085237-ead99009383e onto the v1.34.x tags, which are
+    # semver-HIGHER but content-OLDER: they dropped API this provider calls.
+    # The compile steps below would have caught it on day one -- CI simply was
+    # never a merge gate, so the merged result was never built.
+    #
+    # This step runs before the compile purely so the failure is legible: a
+    # future repeat says "go-unifi no longer exposes X" once, instead of ~100
+    # downstream type errors. It is a fast-fail annotation, not the real
+    # safety net -- `go build ./...` and `go vet ./...` below are.
+    - name: Pinned go-unifi still exposes the API this provider uses
+      run: |
+        set -euo pipefail
+        dir="$(go list -m -f '{{.Dir}}' github.com/ubiquiti-community/go-unifi)"
+        echo "go-unifi resolves to: $dir"
+        rc=0
+        # Verified absent from v1.34.0/v1.34.1, present in the pinned version.
+        for sym in AssistedRoamingEnabled AssistedRoamingRssi; do
+          if ! grep -rq --include='*.go' "$sym" "$dir"; then
+            echo "::error file=go.mod::go-unifi no longer exposes '${sym}'. This is the 2026-08-28 regression: the v1.34.x tags are semver-higher but content-older than the pinned pseudo-version. Do not move the go-unifi pin without checking the API surface first."
+            rc=1
+          fi
+        done
+        exit "$rc"
+
+    # A dependency bump that only builds after go.mod/go.sum are edited is a
+    # bump nobody verified. Fail loudly rather than letting the build fix it up.
+    - name: go.mod and go.sum are consistent with the source tree
+      run: |
+        set -euo pipefail
+        if ! go mod tidy -diff; then
+          echo "::error file=go.mod::go.mod/go.sum are out of sync with the source tree. Run 'go mod tidy' and commit the result."
+          exit 1
+        fi
+
+    # Was `go build -v .`, which compiles only the root package. `./...` covers
+    # every package in the module.
+    - run: go build -v ./...
+
+    # `go vet` type-checks _test.go files as well, so it catches a dependency
+    # API removal that only test code touches -- `go build ./...` does not.
+    - run: go vet ./...
 
   generate:
     runs-on: ubuntu-latest
@@ -73,6 +118,7 @@ jobs:
           (echo; echo "Unexpected difference in directories after code generation. Run 'go generate ./...' command and commit."; exit 1)
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
     - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
@@ -83,10 +129,18 @@ jobs:
 
     - name: Unit tests
       if: always()
-      # -race requires cgo; the coverage profile feeds Codecov below.
+      # Equivalent to `go test ./... -count=1`, plus race detection, JUnit
+      # output and a coverage profile for Codecov. -race requires cgo.
+      #
+      # TF_ACC is pinned empty on purpose. There is no UniFi controller on a
+      # PR runner, so every resource.Test must skip: unifi/provider_test.go's
+      # TestMain short-circuits when TF_ACC is unset and never starts the
+      # testcontainers compose stack. Acceptance coverage stays in
+      # acctest.yaml, which runs on a schedule and on release.
       run: go tool gotestsum --junitfile junit.xml -- -coverprofile=coverage.txt -covermode=atomic -race -count=1 -timeout 120m -v ./...
       env:
         CGO_ENABLED: "1"
+        TF_ACC: ""
 
     - name: Generate HTML coverage report
       if: always()

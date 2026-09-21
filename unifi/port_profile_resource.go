@@ -31,10 +31,11 @@ import (
 
 // Ensure provider defined types fully satisfy framework interfaces.
 var (
-	_ resource.Resource                 = &portProfileResource{}
-	_ resource.ResourceWithImportState  = &portProfileResource{}
-	_ resource.ResourceWithIdentity     = &portProfileResource{}
-	_ resource.ResourceWithUpgradeState = &portProfileResource{}
+	_ resource.Resource                     = &portProfileResource{}
+	_ resource.ResourceWithConfigValidators = &portProfileResource{}
+	_ resource.ResourceWithImportState      = &portProfileResource{}
+	_ resource.ResourceWithIdentity         = &portProfileResource{}
+	_ resource.ResourceWithUpgradeState     = &portProfileResource{}
 )
 
 // Ensure provider defined types fully satisfy list interfaces.
@@ -221,10 +222,12 @@ func (r *portProfileResource) Schema(
 				Default:     booldefault.StaticBool(false),
 			},
 			"forward": schema.StringAttribute{
-				Description: "The type forwarding to use for the port profile. Can be `all`, `native`, `customize` or `disabled`.",
-				Optional:    true,
-				Computed:    true,
-				Default:     stringdefault.StaticString("all"),
+				Description: "The type forwarding to use for the port profile. Can be `all`, `native`, `customize` or `disabled`. " +
+					"Newer controllers derive this from `tagged_vlan_mgmt` (`custom` -> `customize`, `block_all` -> `native`) " +
+					"and ignore a directly written `customize`.",
+				Optional: true,
+				Computed: true,
+				Default:  stringdefault.StaticString("all"),
 				Validators: []validator.String{
 					stringvalidator.OneOf("all", "native", "customize", "disabled"),
 				},
@@ -419,7 +422,12 @@ func (r *portProfileResource) Schema(
 				},
 			},
 			"tagged_networkconf_ids": schema.SetAttribute{
-				Description: "The IDs of networks to tag traffic with for the port profile.",
+				Description: "Deprecated and non-functional. The controller's inclusion-based " +
+					"tagged-VLAN model was replaced by an exclusion-based one: set " +
+					"`tagged_vlan_mgmt = \"custom\"` together with `excluded_networkconf_ids` instead.",
+				DeprecationMessage: "tagged_networkconf_ids is not honoured by the controller and is " +
+					"never applied. Use tagged_vlan_mgmt = \"custom\" with excluded_networkconf_ids " +
+					"instead. This attribute will be removed in a future major release.",
 				Optional:    true,
 				ElementType: types.StringType,
 			},
@@ -1244,6 +1252,103 @@ func (r *portProfileResource) applyPlanToState(
 		state.STPPortMode = plan.STPPortMode
 	}
 	// Apply other fields as needed...
+}
+
+// ConfigValidators implements [resource.ResourceWithConfigValidators].
+func (r *portProfileResource) ConfigValidators(
+	_ context.Context,
+) []resource.ConfigValidator {
+	return []resource.ConfigValidator{&portProfileDiscardedVLANFieldsValidator{}}
+}
+
+// portProfileDiscardedVLANFieldsValidator rejects port-profile configuration
+// the controller accepts with HTTP 200 and then throws away (#3).
+//
+// The legacy inclusion model (forward = "customize" plus tagged_networkconf_ids)
+// was replaced by an exclusion model (tagged_vlan_mgmt = "custom" plus
+// excluded_networkconf_ids). A POST carrying the legacy fields succeeds and the
+// object reads back with forward = "all" and tagged_networkconf_ids unset, so
+// Terraform reports a clean apply for configuration that was never honoured —
+// the same failure class as unifi_firewall_rule on a zone-based gateway.
+//
+// The provider cannot make the legacy fields work, so the next best thing is to
+// stop pretending they do.
+type portProfileDiscardedVLANFieldsValidator struct{}
+
+func (v *portProfileDiscardedVLANFieldsValidator) Description(_ context.Context) string {
+	return "tagged_networkconf_ids is not honoured by the controller; " +
+		"tagged VLANs are managed with tagged_vlan_mgmt and excluded_networkconf_ids"
+}
+
+func (v *portProfileDiscardedVLANFieldsValidator) MarkdownDescription(
+	_ context.Context,
+) string {
+	return "`tagged_networkconf_ids` is not honoured by the controller; tagged VLANs are " +
+		"managed with `tagged_vlan_mgmt` and `excluded_networkconf_ids`"
+}
+
+func (v *portProfileDiscardedVLANFieldsValidator) ValidateResource(
+	ctx context.Context,
+	req resource.ValidateConfigRequest,
+	resp *resource.ValidateConfigResponse,
+) {
+	var taggedNetworkConfIDs types.Set
+	var forward, taggedVLANMgmt types.String
+
+	resp.Diagnostics.Append(
+		req.Config.GetAttribute(ctx, path.Root("tagged_networkconf_ids"), &taggedNetworkConfIDs)...,
+	)
+	resp.Diagnostics.Append(req.Config.GetAttribute(ctx, path.Root("forward"), &forward)...)
+	resp.Diagnostics.Append(
+		req.Config.GetAttribute(ctx, path.Root("tagged_vlan_mgmt"), &taggedVLANMgmt)...,
+	)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	// Any non-null value is rejected — known, unknown, or empty. Whatever it
+	// resolves to, the provider has no field to send it in and the controller
+	// would discard it anyway, so there is no value that could take effect.
+	if !taggedNetworkConfIDs.IsNull() {
+		resp.Diagnostics.AddAttributeError(
+			path.Root("tagged_networkconf_ids"),
+			"tagged_networkconf_ids Is Not Honoured By The Controller",
+			"The controller accepts tagged_networkconf_ids and then discards it: the stored "+
+				"port profile reads back with no tagged networks, so Terraform would report a "+
+				"successful apply for VLAN tagging that never took effect.\n\n"+
+				"Tagged VLANs are configured with the exclusion-based model instead. Set "+
+				"tagged_vlan_mgmt = \"custom\" and list the networks to keep off the port in "+
+				"excluded_networkconf_ids (every other network is tagged), or set "+
+				"tagged_vlan_mgmt = \"block_all\" for a native-only port.",
+		)
+	}
+
+	if portProfileForwardWriteDiscarded(forward, taggedVLANMgmt) {
+		resp.Diagnostics.AddAttributeWarning(
+			path.Root("forward"),
+			"forward Is Derived From tagged_vlan_mgmt",
+			"The controller derives forward from tagged_vlan_mgmt (custom -> \"customize\", "+
+				"block_all -> \"native\") and ignores forward when it is written directly, so "+
+				"forward = \"customize\" on its own is discarded and reads back as \"all\".\n\n"+
+				"Set tagged_vlan_mgmt = \"custom\" (with excluded_networkconf_ids) to get a "+
+				"customized port; forward will then follow on its own.",
+		)
+	}
+}
+
+// portProfileForwardWriteDiscarded reports whether an explicitly configured
+// forward value is one the controller will derive rather than accept. Only
+// "customize" is flagged: it is the value the controller computes from
+// tagged_vlan_mgmt = "custom", so writing it without that selector is a no-op.
+// Unknown values are left alone — they may still resolve to something valid.
+func portProfileForwardWriteDiscarded(forward, taggedVLANMgmt types.String) bool {
+	if forward.IsNull() || forward.IsUnknown() || forward.ValueString() != "customize" {
+		return false
+	}
+	if taggedVLANMgmt.IsUnknown() {
+		return false
+	}
+	return taggedVLANMgmt.IsNull() || taggedVLANMgmt.ValueString() != "custom"
 }
 
 // ListResourceConfigSchema implements [list.ListResource].

@@ -48,7 +48,7 @@ resource "unifi_port_profile" "poe_disabled" {
 - `egress_rate_limit_kbps_enabled` (Boolean) Enable egress rate limiting for the port profile.
 - `excluded_networkconf_ids` (Set of String) The IDs of networks excluded from the port profile (used when `tagged_vlan_mgmt` is `custom`). Computed from the controller when not set.
 - `fec_mode` (String) Forward Error Correction mode. Can be `rs-fec`, `fc-fec`, `default`, or `disabled`.
-- `forward` (String) The type forwarding to use for the port profile. Can be `all`, `native`, `customize` or `disabled`.
+- `forward` (String) The type forwarding to use for the port profile. Can be `all`, `native`, `customize` or `disabled`. Newer controllers derive this from `tagged_vlan_mgmt` (`custom` -> `customize`, `block_all` -> `native`) and ignore a directly written `customize`.
 - `full_duplex` (Boolean) Enable full duplex for the port profile.
 - `isolation` (Boolean) Enable port isolation for the port profile.
 - `lldpmed_enabled` (Boolean) Enable LLDP-MED for the port profile.
@@ -79,7 +79,7 @@ resource "unifi_port_profile" "poe_disabled" {
 - `stormctrl_ucast_level` (Number) The unknown unicast Storm Control level for the port profile. Can be between 0 and 100.
 - `stormctrl_ucast_rate` (Number) The unknown unicast Storm Control rate for the port profile. Can be between 0 and 14880000.
 - `stp_port_mode` (Boolean) Enable Spanning Tree Protocol (STP) for the port profile. Computed from the controller when not set.
-- `tagged_networkconf_ids` (Set of String) The IDs of networks to tag traffic with for the port profile.
+- `tagged_networkconf_ids` (Set of String, Deprecated) Deprecated and non-functional. The controller's inclusion-based tagged-VLAN model was replaced by an exclusion-based one: set `tagged_vlan_mgmt = "custom"` together with `excluded_networkconf_ids` instead.
 - `tagged_vlan_mgmt` (String) How tagged VLANs are managed on the port. Can be `auto`, `block_all`, or `custom`.
 - `timeouts` (Attributes) (see [below for nested schema](#nestedatt--timeouts))
 - `voice_networkconf_id` (String) The ID of network to use for voice traffic for the port profile.

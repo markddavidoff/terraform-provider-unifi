@@ -9,7 +9,9 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/diag"
 	fwlist "github.com/hashicorp/terraform-plugin-framework/list"
 	fwresource "github.com/hashicorp/terraform-plugin-framework/resource"
+	"github.com/hashicorp/terraform-plugin-framework/tfsdk"
 	"github.com/hashicorp/terraform-plugin-framework/types"
+	"github.com/hashicorp/terraform-plugin-go/tftypes"
 	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
 	"github.com/hashicorp/terraform-plugin-testing/querycheck"
 	"github.com/hashicorp/terraform-plugin-testing/tfversion"
@@ -593,4 +595,174 @@ func TestAccPortProfileList_basic(t *testing.T) {
 			},
 		},
 	})
+}
+
+// portProfileConfig builds a tfsdk.Config from the resource's real schema with
+// every attribute null, then applies the supplied overrides. Anchoring to
+// Schema() (the real producer of the config shape) rather than hand-rolling an
+// object type means a schema change cannot silently desync this fixture.
+func portProfileConfig(
+	ctx context.Context,
+	t *testing.T,
+	overrides map[string]tftypes.Value,
+) tfsdk.Config {
+	t.Helper()
+
+	r := &portProfileResource{}
+	var schemaResp fwresource.SchemaResponse
+	r.Schema(ctx, fwresource.SchemaRequest{}, &schemaResp)
+
+	schemaType, ok := schemaResp.Schema.Type().TerraformType(ctx).(tftypes.Object)
+	if !ok {
+		t.Fatal("port profile schema type is not tftypes.Object")
+	}
+
+	attrVals := make(map[string]tftypes.Value, len(schemaType.AttributeTypes))
+	for name, typ := range schemaType.AttributeTypes {
+		attrVals[name] = tftypes.NewValue(typ, nil)
+	}
+	for name, val := range overrides {
+		if _, known := schemaType.AttributeTypes[name]; !known {
+			t.Fatalf("override %q is not an attribute of the port profile schema", name)
+		}
+		attrVals[name] = val
+	}
+
+	return tfsdk.Config{
+		Schema: schemaResp.Schema,
+		Raw:    tftypes.NewValue(schemaType, attrVals),
+	}
+}
+
+// Test_portProfileResource_discardedVLANFields is a minimal repro of the
+// silent-drop reported in #3. On Network 10.x the controller accepts
+// tagged_networkconf_ids (and a directly-written forward) with HTTP 200 and
+// then discards both — the stored object reads back forward="all" and
+// tagged_networkconf_ids=null. The provider compounds this: it has no go-unifi
+// field for tagged_networkconf_ids at all, so the value never even leaves the
+// process, and portProfileToModel unconditionally nulls it on read.
+//
+// The result is a clean `terraform apply` for configuration that was never
+// honoured. This test asserts the provider emits a diagnostic instead.
+func Test_portProfileResource_discardedVLANFields(t *testing.T) {
+	ctx := context.Background()
+	r := &portProfileResource{}
+
+	taggedSet := tftypes.Set{ElementType: tftypes.String}
+
+	tests := []struct {
+		name      string
+		overrides map[string]tftypes.Value
+		wantError bool
+		wantWarn  bool
+	}{
+		{
+			name:      "unset: no diagnostic",
+			overrides: nil,
+		},
+		{
+			name: "exclusion model (the one that works): no diagnostic",
+			overrides: map[string]tftypes.Value{
+				"tagged_vlan_mgmt": tftypes.NewValue(tftypes.String, "custom"),
+				"excluded_networkconf_ids": tftypes.NewValue(taggedSet, []tftypes.Value{
+					tftypes.NewValue(tftypes.String, "6501f2a1b0c1d2e3f4a5b6c7"),
+				}),
+			},
+		},
+		{
+			name: "tagged_networkconf_ids set: error",
+			overrides: map[string]tftypes.Value{
+				"tagged_networkconf_ids": tftypes.NewValue(taggedSet, []tftypes.Value{
+					tftypes.NewValue(tftypes.String, "6501f2a1b0c1d2e3f4a5b6c7"),
+				}),
+			},
+			wantError: true,
+		},
+		{
+			name: "tagged_networkconf_ids empty set: error",
+			overrides: map[string]tftypes.Value{
+				"tagged_networkconf_ids": tftypes.NewValue(taggedSet, []tftypes.Value{}),
+			},
+			wantError: true,
+		},
+		{
+			name: "tagged_networkconf_ids unknown: error",
+			overrides: map[string]tftypes.Value{
+				"tagged_networkconf_ids": tftypes.NewValue(taggedSet, tftypes.UnknownValue),
+			},
+			wantError: true,
+		},
+		{
+			name: "forward=customize without tagged_vlan_mgmt=custom: warning",
+			overrides: map[string]tftypes.Value{
+				"forward": tftypes.NewValue(tftypes.String, "customize"),
+			},
+			wantWarn: true,
+		},
+		{
+			name: "forward=customize with tagged_vlan_mgmt=custom: no diagnostic",
+			overrides: map[string]tftypes.Value{
+				"forward":          tftypes.NewValue(tftypes.String, "customize"),
+				"tagged_vlan_mgmt": tftypes.NewValue(tftypes.String, "custom"),
+			},
+		},
+		{
+			name: "forward=native: no diagnostic",
+			overrides: map[string]tftypes.Value{
+				"forward": tftypes.NewValue(tftypes.String, "native"),
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			// Asserted through the interface rather than the concrete method so
+			// this test compiles (and fails loudly) before the fix exists.
+			withValidators, ok := any(r).(fwresource.ResourceWithConfigValidators)
+			if !ok {
+				t.Fatal(
+					"portProfileResource does not implement ResourceWithConfigValidators: " +
+						"tagged_networkconf_ids is accepted and then silently discarded",
+				)
+			}
+			configValidators := withValidators.ConfigValidators(ctx)
+			if len(configValidators) == 0 {
+				t.Fatal("port profile resource registers no config validators")
+			}
+
+			resp := &fwresource.ValidateConfigResponse{}
+			req := fwresource.ValidateConfigRequest{
+				Config: portProfileConfig(ctx, t, tc.overrides),
+			}
+			for _, v := range configValidators {
+				v.ValidateResource(ctx, req, resp)
+			}
+
+			if got := resp.Diagnostics.HasError(); got != tc.wantError {
+				t.Errorf("HasError() = %v, want %v (diags: %v)", got, tc.wantError, resp.Diagnostics)
+			}
+			if got := resp.Diagnostics.WarningsCount() > 0; got != tc.wantWarn {
+				t.Errorf("has warning = %v, want %v (diags: %v)", got, tc.wantWarn, resp.Diagnostics)
+			}
+		})
+	}
+}
+
+// Test_portProfileResource_taggedNetworkConfIDsDeprecated guards that the dead
+// attribute is marked deprecated in the schema, so `terraform validate` and the
+// generated docs point users at the exclusion-based replacement.
+func Test_portProfileResource_taggedNetworkConfIDsDeprecated(t *testing.T) {
+	ctx := context.Background()
+	r := &portProfileResource{}
+
+	var schemaResp fwresource.SchemaResponse
+	r.Schema(ctx, fwresource.SchemaRequest{}, &schemaResp)
+
+	taggedAttr, ok := schemaResp.Schema.Attributes["tagged_networkconf_ids"]
+	if !ok {
+		t.Fatal("tagged_networkconf_ids attribute is missing from the schema")
+	}
+	if taggedAttr.GetDeprecationMessage() == "" {
+		t.Error("tagged_networkconf_ids has no DeprecationMessage; the controller discards it")
+	}
 }

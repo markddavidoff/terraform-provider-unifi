@@ -1006,6 +1006,24 @@ func (r *portProfileResource) setResourceData(
 	r.portProfileToModel(ctx, portProfile, model, site)
 }
 
+// dedupeNetworkIDs collapses repeated IDs in a controller-supplied network ID
+// list, preserving order. The controller can report the same ID twice in
+// excluded_networkconf_ids (#1); a Terraform set has no multiplicity, so
+// handing the raw list to types.SetValueFrom fails with "Duplicate Set
+// Element" and leaves the resource impossible to read, plan or destroy.
+func dedupeNetworkIDs(ids []string) []string {
+	seen := make(map[string]struct{}, len(ids))
+	out := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		out = append(out, id)
+	}
+	return out
+}
+
 // portProfileToModel populates the resource model from the API struct, setting
 // every schema field. It is the reusable API->model converter shared by Read
 // and List. It only performs API->model field population; plan/state
@@ -1130,7 +1148,11 @@ func (r *portProfileResource) portProfileToModel(
 	model.PortKeepaliveEnabled = types.BoolValue(portProfile.PortKeepaliveEnabled)
 
 	if len(portProfile.ExcludedNetworkIDs) > 0 {
-		s, d := types.SetValueFrom(ctx, types.StringType, portProfile.ExcludedNetworkIDs)
+		s, d := types.SetValueFrom(
+			ctx,
+			types.StringType,
+			dedupeNetworkIDs(portProfile.ExcludedNetworkIDs),
+		)
 		diags.Append(d...)
 		model.ExcludedNetworkConfIDs = s
 	} else {

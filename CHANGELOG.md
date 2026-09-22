@@ -2,6 +2,57 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.55.1001] — 2026-09-21 — fork release (`markddavidoff/unifi`)
+
+First release of the patched fork. Version reads as "upstream 0.55 lineage,
+fork patch 1001"; the high patch number marks divergence and sorts above any
+plausible upstream `0.55.x`. Cut from upstream `main`, which is past `v0.55.0`.
+
+### 🐛 Bug Fixes
+
+- **`unifi_port_profile`: collapse duplicate `excluded_networkconf_ids` on read.**
+  The controller can return the same network id twice; a Terraform set cannot
+  hold duplicates, so the resource became permanently unplannable
+  (`Duplicate Set Element`) and could not be destroyed without
+  `-refresh=false`. Verified against live hardware: the controller still
+  stores the duplicate, but a one-shot create now re-plans clean. (#1, #8)
+- **`unifi_network`: never send an empty `dhcpd_start`/`dhcpd_stop` on create.**
+  The provider emitted them as `""` alongside `setting_preference: "auto"`,
+  which the controller answers with an unhandled HTTP 500 (retried 5× over
+  ~16 s). Either alone is fine; only the pair breaks. **Note:** with
+  `setting_preference = "auto"` the controller auto-derives a DHCP range and
+  enables DHCP, overriding `dhcp_server.enabled = false` — set
+  `setting_preference = "manual"` if you want DHCP genuinely off. (#2, #6)
+- **`unifi_port_profile`: fail loudly on `tagged_networkconf_ids`.**
+  On Network 10.x the controller accepts it with HTTP 200 and silently
+  discards it, so Terraform reported success for VLAN tagging that never took
+  effect. Now deprecated with a plan-time error pointing at the
+  exclusion-based model (`tagged_vlan_mgmt` + `excluded_networkconf_ids`).
+  (#3, #7)
+- **`unifi_network`: a 404 on read removes the resource from state** instead
+  of raising a hard error, so an out-of-band delete shows as drift and
+  recreates rather than breaking every subsequent plan. (#4, #5)
+
+### 🔧 Dependencies
+
+- `replace` go-unifi onto `markddavidoff/go-unifi` `compat/v1.33-lastgood`,
+  carrying **do not retry POST on 5xx** (duplicate-create risk) and a final
+  error that keeps the status code instead of a bare
+  `giving up after N attempt(s)`. (go-unifi#1, #10)
+- Pinned go-unifi back to the last-good pseudo-version: upstream `main` had
+  not compiled since 2026-08-28, after Dependabot moved it to `v1.34.x`,
+  which is semver-higher but content-older and lacks
+  `settings.SettingIpsSuppression` and `DeviceRadioTable.AssistedRoaming*`.
+  (#9)
+
+### 👷 CI
+
+- CI is now a real merge gate (`go build ./...`, `go vet ./...`,
+  `go test ./... -count=1`, `go mod tidy -diff`, no path filter), and
+  Dependabot auto-merge is restricted to patch-level updates that passed CI
+  for that head SHA. The outage above was a **minor** bump, so a
+  major-only gate would not have caught it. (#11)
+
 ## [Unreleased]
 
 ### ✨ Features
